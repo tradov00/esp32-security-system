@@ -1,32 +1,25 @@
-
 #include <Arduino.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <string.h>
 
-// =====================================================
 // CONFIGURATION
-// =====================================================
-
 #define STATUS_PIN 2
+#define SENSOR_PIN 4
 
 const char CORRECT_PIN[] = "1234";
 
 const unsigned long UPTIME_INTERVAL = 1000;
 const unsigned long LOCKOUT_DURATION = 30000;
 const unsigned long ALARM_DURATION = 10000;
+const unsigned long SENSOR_DEBOUNCE = 50;
 
 const uint8_t MAX_PIN_ATTEMPTS = 3;
-
 const uint8_t EVENT_QUEUE_SIZE = 8;
 const uint8_t HISTORY_SIZE = 10;
-
 const uint8_t INPUT_BUFFER_SIZE = 32;
 
-// =====================================================
 // FINITE STATE MACHINE
-// =====================================================
-
 enum SystemState {
     DISARMED,
     ARMED,
@@ -35,62 +28,51 @@ enum SystemState {
 
 SystemState currentState = DISARMED;
 
-// =====================================================
+// STATISTICS COUNTERS
+uint32_t totalIntrusionEvents = 0;
+uint32_t totalAlarmActivations = 0;
+uint32_t totalFailedPinAttempts = 0;
+
 // ALARM TIMER
-// =====================================================
-
 unsigned long alarmStartTime = 0;
+bool alarmWaitingForSensorClear = false;
 
-// =====================================================
+// INTRUSION SENSOR
+bool lastSensorReading = HIGH;
+bool stableSensorState = HIGH;
+unsigned long lastDebounceTime = 0;
+
 // EVENT SYSTEM
-// =====================================================
-
 struct SystemEvent {
     SystemState state;
     unsigned long timestamp;
 };
 
-// Circular event queue
 SystemEvent eventQueue[EVENT_QUEUE_SIZE];
 
 uint8_t queueHead = 0;
 uint8_t queueTail = 0;
 uint8_t queueCount = 0;
 
-// Event history
 SystemEvent eventHistory[HISTORY_SIZE];
 
 uint8_t historyIndex = 0;
 uint8_t historyCount = 0;
 
-// =====================================================
 // SERIAL INPUT
-// =====================================================
-
 char inputBuffer[INPUT_BUFFER_SIZE];
 uint8_t inputIndex = 0;
-
 bool inputOverflow = false;
 
-// =====================================================
 // PIN AUTHENTICATION
-// =====================================================
-
 uint8_t failedPinAttempts = 0;
-
 bool systemLocked = false;
 unsigned long lockoutStartTime = 0;
 
-// =====================================================
 // TIMING
-// =====================================================
-
 unsigned long lastUptimePrint = 0;
 
-// =====================================================
 // FUNCTION DECLARATIONS
-// =====================================================
-
 void processSerialInput();
 void processCommand(char* commandLine);
 
@@ -107,6 +89,7 @@ bool transitionTo(SystemState newState);
 void updateGPIO();
 
 void processAlarmTimer();
+void processIntrusionSensor();
 
 bool enqueueEvent(SystemState state);
 bool dequeueEvent(SystemEvent& event);
@@ -118,16 +101,19 @@ void printStateName(SystemState state);
 void printTimestamp(unsigned long timestamp);
 
 char* getNextToken(char*& cursor);
+void resetStatistics();
 
-// =====================================================
 // SETUP
-// =====================================================
-
 void setup() {
 
     Serial.begin(115200);
 
     pinMode(STATUS_PIN, OUTPUT);
+    pinMode(SENSOR_PIN, INPUT_PULLUP);
+
+    lastSensorReading = digitalRead(SENSOR_PIN);
+    stableSensorState = lastSensorReading;
+    lastDebounceTime = millis();
 
     currentState = DISARMED;
 
@@ -142,6 +128,9 @@ void setup() {
 
     Serial.println("System initialized!");
 
+    Serial.println("Intrusion sensor: GPIO4");
+    Serial.println("Sensor status: READY");
+
     printHelp();
 
     Serial.println("Current system state: DISARMED");
@@ -149,13 +138,12 @@ void setup() {
     Serial.println();
 }
 
-// =====================================================
 // MAIN LOOP
-// =====================================================
-
 void loop() {
 
     processSerialInput();
+
+    processIntrusionSensor();
 
     processAlarmTimer();
 
@@ -171,10 +159,7 @@ void loop() {
     }
 }
 
-// =====================================================
 // SERIAL INPUT
-// =====================================================
-
 void processSerialInput() {
 
     while (Serial.available() > 0) {
@@ -204,7 +189,6 @@ void processSerialInput() {
             continue;
         }
 
-        // Backspace support
         if (incomingChar == '\b' || incomingChar == 127) {
 
             if (inputIndex > 0) {
@@ -214,7 +198,6 @@ void processSerialInput() {
             continue;
         }
 
-        // Printable ASCII characters
         if (incomingChar >= 32 && incomingChar <= 126) {
 
             if (inputIndex < INPUT_BUFFER_SIZE - 1) {
@@ -228,26 +211,29 @@ void processSerialInput() {
         }
     }
 }
-
-// =====================================================
 // COMMAND PROCESSING
-// =====================================================
-
 void processCommand(char* commandLine) {
 
     char* cursor = commandLine;
 
     char* command = getNextToken(cursor);
     char* argument = getNextToken(cursor);
-    char* extraArgument = getNextToken(cursor);
+    char* thirdArgument = getNextToken(cursor);
+    char* fourthArgument = getNextToken(cursor);
 
     if (command == nullptr) {
         return;
     }
 
-    // Convert command to uppercase
+    // Commands and keywords are case-insensitive.
     for (uint8_t i = 0; command[i] != '\0'; i++) {
         command[i] = toupper((unsigned char)command[i]);
+    }
+
+    if (argument != nullptr) {
+        for (uint8_t i = 0; argument[i] != '\0'; i++) {
+            argument[i] = toupper((unsigned char)argument[i]);
+        }
     }
 
     // HELP
@@ -312,24 +298,25 @@ void processCommand(char* commandLine) {
 
         Serial.println("Simulated intrusion detected!");
 
+        totalIntrusionEvents++;
+
         transitionTo(ALARM_TRIGGERED);
 
         return;
     }
 
-    // ARM / DISARM
-    if (strcmp(command, "ARM") == 0 ||
-        strcmp(command, "DISARM") == 0) {
+    // RESET STATS
+    if (strcmp(command, "RESET") == 0) {
 
-        if (argument == nullptr || extraArgument != nullptr) {
+        if (argument == nullptr ||
+            strcmp(argument, "STATS") != 0 ||
+            thirdArgument == nullptr ||
+            fourthArgument != nullptr) {
 
-            Serial.println("Authentication required!");
-            Serial.println("Usage: ARM <PIN> or DISARM <PIN>");
-
+            Serial.println("Usage: RESET STATS <PIN>");
             return;
         }
 
-        // Check lockout
         if (isLockoutActive()) {
 
             unsigned long elapsed = millis() - lockoutStartTime;
@@ -344,14 +331,59 @@ void processCommand(char* commandLine) {
             return;
         }
 
-        // Authenticate
+        if (!authenticatePIN(thirdArgument)) {
+            return;
+        }
+
+        resetStatistics();
+
+        return;
+    }
+
+    // ARM / DISARM
+    if (strcmp(command, "ARM") == 0 ||
+        strcmp(command, "DISARM") == 0) {
+
+        if (argument == nullptr ||
+            thirdArgument != nullptr ||
+            fourthArgument != nullptr) {
+
+            Serial.println("Authentication required!");
+            Serial.println("Usage: ARM <PIN> or DISARM <PIN>");
+
+            return;
+        }
+
+        if (isLockoutActive()) {
+
+            unsigned long elapsed = millis() - lockoutStartTime;
+
+            unsigned long remaining =
+                (LOCKOUT_DURATION - elapsed + 999) / 1000;
+
+            Serial.print("System locked. Try again in ");
+            Serial.print(remaining);
+            Serial.println(" seconds.");
+
+            return;
+        }
+
         if (!authenticatePIN(argument)) {
             return;
         }
 
         if (strcmp(command, "ARM") == 0) {
 
-            transitionTo(ARMED);
+            if (transitionTo(ARMED) &&
+                stableSensorState == LOW) {
+
+                Serial.println("Warning: intrusion sensor is ACTIVE!");
+                Serial.println("Physical intrusion detected on GPIO4!");
+
+                totalIntrusionEvents++;
+
+                transitionTo(ALARM_TRIGGERED);
+            }
 
         } else {
 
@@ -361,14 +393,10 @@ void processCommand(char* commandLine) {
         return;
     }
 
-    // Unknown command
     Serial.println("Unknown command! Type HELP for available commands.");
 }
 
-// =====================================================
 // TOKEN PARSER
-// =====================================================
-
 char* getNextToken(char*& cursor) {
 
     while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
@@ -393,10 +421,7 @@ char* getNextToken(char*& cursor) {
     return token;
 }
 
-// =====================================================
 // PIN AUTHENTICATION
-// =====================================================
-
 bool authenticatePIN(const char* enteredPIN) {
 
     if (!isValidPINFormat(enteredPIN)) {
@@ -418,6 +443,7 @@ bool authenticatePIN(const char* enteredPIN) {
     }
 
     failedPinAttempts++;
+    totalFailedPinAttempts++;
 
     Serial.println("Incorrect PIN!");
 
@@ -441,10 +467,7 @@ bool authenticatePIN(const char* enteredPIN) {
     return false;
 }
 
-// =====================================================
 // PIN FORMAT VALIDATION
-// =====================================================
-
 bool isValidPINFormat(const char* pin) {
 
     if (strlen(pin) != 4) {
@@ -461,10 +484,7 @@ bool isValidPINFormat(const char* pin) {
     return true;
 }
 
-// =====================================================
 // LOCKOUT MANAGEMENT
-// =====================================================
-
 bool isLockoutActive() {
 
     if (!systemLocked) {
@@ -487,26 +507,35 @@ bool isLockoutActive() {
 
     return true;
 }
+// RESET STATISTICS
+void resetStatistics() {
 
-// =====================================================
+    totalIntrusionEvents = 0;
+    totalAlarmActivations = 0;
+    totalFailedPinAttempts = 0;
+
+    Serial.println();
+    Serial.println("System statistics successfully reset!");
+
+    Serial.println("Total intrusion events: 0");
+    Serial.println("Total alarm activations: 0");
+    Serial.println("Total failed PIN attempts: 0");
+
+    Serial.println();
+}
+
 // FINITE STATE MACHINE
-// =====================================================
-
 bool transitionTo(SystemState newState) {
 
-    // Prevent unnecessary transitions
     if (newState == currentState) {
 
         Serial.print("System already ");
-
         printStateName(currentState);
-
         Serial.println("!");
 
         return false;
     }
 
-    // Validate allowed transitions
     bool transitionAllowed = false;
 
     switch (currentState) {
@@ -547,54 +576,70 @@ bool transitionTo(SystemState newState) {
         return false;
     }
 
-    // Update state
     currentState = newState;
 
-    // Start alarm timer when entering ALARM_TRIGGERED
     if (newState == ALARM_TRIGGERED) {
 
         alarmStartTime = millis();
 
+        alarmWaitingForSensorClear = false;
+
+        totalAlarmActivations++;
+
         Serial.println("Alarm activated!");
-        Serial.println("Alarm will reset automatically after 10 seconds.");
+        Serial.println(
+            "Alarm will reset automatically after 10 seconds."
+        );
     }
 
-    // Update hardware output
     updateGPIO();
 
-    // Record state change
     enqueueEvent(currentState);
 
     return true;
 }
 
-// =====================================================
 // ALARM TIMER
-// =====================================================
-
 void processAlarmTimer() {
 
-    // Timer only runs while alarm is triggered
     if (currentState != ALARM_TRIGGERED) {
         return;
     }
 
     unsigned long elapsed = millis() - alarmStartTime;
 
-    if (elapsed >= ALARM_DURATION) {
-
-        Serial.println();
-        Serial.println("Alarm duration expired!");
-        Serial.println("Automatically returning to ARMED state.");
-
-        transitionTo(ARMED);
+    if (elapsed < ALARM_DURATION) {
+        return;
     }
+
+    if (stableSensorState == LOW) {
+
+        if (!alarmWaitingForSensorClear) {
+
+            Serial.println();
+            Serial.println("Alarm duration expired!");
+            Serial.println(
+                "Intrusion sensor is still ACTIVE!"
+            );
+            Serial.println(
+                "Alarm remains active until the sensor is cleared."
+            );
+
+            alarmWaitingForSensorClear = true;
+        }
+
+        return;
+    }
+
+    Serial.println();
+    Serial.println("Alarm duration expired!");
+    Serial.println("Intrusion sensor is INACTIVE.");
+    Serial.println("Automatically returning to ARMED state.");
+
+    transitionTo(ARMED);
 }
 
-// =====================================================
 // GPIO CONTROL
-// =====================================================
-
 void updateGPIO() {
 
     if (currentState == DISARMED) {
@@ -603,15 +648,47 @@ void updateGPIO() {
 
     } else {
 
-        // ARMED and ALARM_TRIGGERED
         digitalWrite(STATUS_PIN, HIGH);
     }
 }
 
-// =====================================================
-// EVENT QUEUE
-// =====================================================
+// INTRUSION SENSOR
+void processIntrusionSensor() {
 
+    bool reading = digitalRead(SENSOR_PIN);
+
+    if (reading != lastSensorReading) {
+
+        lastDebounceTime = millis();
+
+        lastSensorReading = reading;
+    }
+
+    if (millis() - lastDebounceTime >= SENSOR_DEBOUNCE) {
+
+        if (reading != stableSensorState) {
+
+            stableSensorState = reading;
+
+            if (stableSensorState == LOW) {
+
+                if (currentState == ARMED) {
+
+                    Serial.println();
+                    Serial.println(
+                        "Physical intrusion detected on GPIO4!"
+                    );
+
+                    totalIntrusionEvents++;
+
+                    transitionTo(ALARM_TRIGGERED);
+                }
+            }
+        }
+    }
+}
+
+// EVENT QUEUE
 bool enqueueEvent(SystemState state) {
 
     if (queueCount >= EVENT_QUEUE_SIZE) {
@@ -622,7 +699,6 @@ bool enqueueEvent(SystemState state) {
     }
 
     eventQueue[queueTail].state = state;
-
     eventQueue[queueTail].timestamp = millis() / 1000;
 
     queueTail = (queueTail + 1) % EVENT_QUEUE_SIZE;
@@ -647,10 +723,7 @@ bool dequeueEvent(SystemEvent& event) {
     return true;
 }
 
-// =====================================================
 // EVENT PROCESSING
-// =====================================================
-
 void processPendingEvents() {
 
     SystemEvent event;
@@ -660,9 +733,7 @@ void processPendingEvents() {
         addToHistory(event);
 
         Serial.print("[");
-
         printTimestamp(event.timestamp);
-
         Serial.print("] STATE CHANGED: ");
 
         printStateName(event.state);
@@ -671,10 +742,7 @@ void processPendingEvents() {
     }
 }
 
-// =====================================================
 // EVENT HISTORY
-// =====================================================
-
 void addToHistory(const SystemEvent& event) {
 
     eventHistory[historyIndex] = event;
@@ -706,9 +774,7 @@ void printEventHistory() {
                 (oldestIndex + i) % HISTORY_SIZE;
 
             Serial.print("[");
-
             printTimestamp(eventHistory[index].timestamp);
-
             Serial.print("] STATE CHANGED: ");
 
             printStateName(eventHistory[index].state);
@@ -720,11 +786,7 @@ void printEventHistory() {
     Serial.println("===================================");
     Serial.println();
 }
-
-// =====================================================
 // STATE NAME
-// =====================================================
-
 void printStateName(SystemState state) {
 
     switch (state) {
@@ -747,19 +809,14 @@ void printStateName(SystemState state) {
     }
 }
 
-// =====================================================
 // SYSTEM STATUS
-// =====================================================
-
 void printStatus() {
 
     Serial.println();
     Serial.println("========== SYSTEM STATUS ==========");
 
     Serial.print("System state: ");
-
     printStateName(currentState);
-
     Serial.println();
 
     Serial.print("GPIO2 output: ");
@@ -770,31 +827,74 @@ void printStatus() {
         Serial.println("LOW");
     }
 
+    Serial.print("GPIO4 sensor: ");
+
+    if (digitalRead(SENSOR_PIN) == HIGH) {
+        Serial.println("INACTIVE (HIGH)");
+    } else {
+        Serial.println("ACTIVE (LOW)");
+    }
+
     if (currentState == ALARM_TRIGGERED) {
 
         unsigned long elapsed = millis() - alarmStartTime;
 
-        unsigned long remaining =
-            (ALARM_DURATION - elapsed + 999) / 1000;
+        unsigned long remaining = 0;
+
+        if (elapsed < ALARM_DURATION) {
+            remaining =
+                (ALARM_DURATION - elapsed + 999) / 1000;
+        }
 
         Serial.print("Alarm time remaining: ");
         Serial.print(remaining);
         Serial.println(" seconds");
+
+        if (alarmWaitingForSensorClear ||
+            stableSensorState == LOW) {
+
+            Serial.println(
+                "Alarm reset: WAITING FOR SENSOR CLEAR"
+            );
+        }
     }
 
-    Serial.print("Failed PIN attempts: ");
+    Serial.println();
+    Serial.println("========== SYSTEM STATISTICS ==========");
+
+    Serial.print("Total intrusion events: ");
+    Serial.println((unsigned long)totalIntrusionEvents);
+
+    Serial.print("Total alarm activations: ");
+    Serial.println((unsigned long)totalAlarmActivations);
+
+    Serial.print("Total failed PIN attempts: ");
+    Serial.println((unsigned long)totalFailedPinAttempts);
+
+    Serial.println("=======================================");
+
+    Serial.println();
+
+    Serial.print("Consecutive failed PIN attempts: ");
     Serial.println(failedPinAttempts);
 
     if (systemLocked) {
 
         unsigned long elapsed = millis() - lockoutStartTime;
 
-        unsigned long remaining =
-            (LOCKOUT_DURATION - elapsed + 999) / 1000;
+        if (elapsed >= LOCKOUT_DURATION) {
 
-        Serial.print("PIN lockout: ACTIVE (");
-        Serial.print(remaining);
-        Serial.println(" seconds remaining)");
+            Serial.println("PIN lockout: INACTIVE");
+
+        } else {
+
+            unsigned long remaining =
+                (LOCKOUT_DURATION - elapsed + 999) / 1000;
+
+            Serial.print("PIN lockout: ACTIVE (");
+            Serial.print(remaining);
+            Serial.println(" seconds remaining)");
+        }
 
     } else {
 
@@ -805,30 +905,25 @@ void printStatus() {
     Serial.println();
 }
 
-// =====================================================
 // HELP
-// =====================================================
-
 void printHelp() {
 
     Serial.println();
     Serial.println("========== AVAILABLE COMMANDS ==========");
 
-    Serial.println("ARM <PIN>     - Activate the security system");
-    Serial.println("DISARM <PIN>  - Deactivate the security system");
-    Serial.println("TRIGGER       - Simulate an intrusion event");
-    Serial.println("STATUS        - Display current system status");
-    Serial.println("LOG           - Display event history");
-    Serial.println("HELP          - Display available commands");
+    Serial.println("ARM <PIN>         - Activate the security system");
+    Serial.println("DISARM <PIN>      - Deactivate the security system");
+    Serial.println("TRIGGER           - Simulate an intrusion event");
+    Serial.println("STATUS            - Display current system status");
+    Serial.println("LOG               - Display event history");
+    Serial.println("RESET STATS <PIN> - Reset system statistics");
+    Serial.println("HELP              - Display available commands");
 
     Serial.println("========================================");
     Serial.println();
 }
 
-// =====================================================
 // UPTIME
-// =====================================================
-
 void printUptime() {
 
     unsigned long uptimeSeconds = millis() / 1000;
@@ -853,10 +948,7 @@ void printUptime() {
     Serial.println(seconds);
 }
 
-// =====================================================
 // TIMESTAMP
-// =====================================================
-
 void printTimestamp(unsigned long timestamp) {
 
     unsigned long hours = timestamp / 3600;
